@@ -97,15 +97,23 @@ export const getMyBids = async (req, res) => {
   }
 };
 
-// @desc    Hire a freelancer (CRUCIAL LOGIC with Atomic Operations)
+// @desc    Hire a freelancer (CRUCIAL LOGIC with MongoDB Transactions)
 // @route   PATCH /api/bids/:bidId/hire
 // @access  Private
+// Bonus 1: Transactional Integrity - Uses MongoDB transactions to prevent race conditions
 export const hireBid = async (req, res) => {
+  // Start a MongoDB session for transaction
+  const session = await mongoose.startSession();
+  
   try {
-    // Find the bid
-    const bid = await Bid.findById(req.params.bidId).populate('gig');
+    // Start transaction
+    session.startTransaction();
+
+    // Find the bid within transaction
+    const bid = await Bid.findById(req.params.bidId).populate('gig').session(session);
 
     if (!bid) {
+      await session.abortTransaction();
       return res.status(404).json({ message: 'Bid not found' });
     }
 
@@ -113,22 +121,32 @@ export const hireBid = async (req, res) => {
 
     // Check if user is the owner of the gig
     if (gig.owner.toString() !== req.user._id.toString()) {
+      await session.abortTransaction();
       return res.status(403).json({ message: 'Not authorized to hire for this gig' });
     }
 
-    // Check if gig is still open
+    // CRITICAL: Check if gig is still open (Race Condition Prevention)
     if (gig.status !== 'open') {
-      return res.status(400).json({ message: 'This gig is already assigned' });
+      await session.abortTransaction();
+      return res.status(400).json({ message: 'This gig is already assigned. Another hire was processed.' });
     }
 
-    // ATOMIC OPERATIONS (Bonus 1: Transactional Integrity):
-    // Perform all updates sequentially for consistency
+    // ATOMIC OPERATIONS within MongoDB Transaction (Bonus 1: Transactional Integrity)
+    // All operations succeed together or all fail together
     
     // 1. Update the gig status to 'assigned'
-    await Gig.findByIdAndUpdate(gig._id, { status: 'assigned' });
+    const gigUpdate = await Gig.findByIdAndUpdate(
+      gig._id,
+      { status: 'assigned' },
+      { new: true, session }
+    );
 
     // 2. Update the chosen bid status to 'hired'
-    await Bid.findByIdAndUpdate(bid._id, { status: 'hired' });
+    const bidUpdate = await Bid.findByIdAndUpdate(
+      bid._id,
+      { status: 'hired' },
+      { new: true, session }
+    );
 
     // 3. Update all other bids for this gig to 'rejected'
     await Bid.updateMany(
@@ -137,10 +155,14 @@ export const hireBid = async (req, res) => {
         _id: { $ne: bid._id },
         status: 'pending',
       },
-      { status: 'rejected' }
+      { status: 'rejected' },
+      { session }
     );
 
-    // Fetch updated bid with populated data
+    // Commit the transaction - all changes are applied atomically
+    await session.commitTransaction();
+
+    // Fetch updated bid with populated data (outside transaction)
     const updatedBid = await Bid.findById(bid._id)
       .populate('freelancer', 'name email')
       .populate('gig', 'title description budget status');
@@ -148,22 +170,27 @@ export const hireBid = async (req, res) => {
     // Send real-time notification to the hired freelancer (Bonus 2)
     if (req.io) {
       req.io.emit('hiringNotification', {
-        freelancerId: bid.freelancer._id.toString(),
+        freelancerId: updatedBid.freelancer._id.toString(),
         gigTitle: gig.title,
         clientName: req.user.name,
         message: `You have been hired for "${gig.title}"!`,
       });
     }
 
-    // Return the hired bid with gig details for socket notification
+    // Return the hired bid with gig details
     res.json({
       message: 'Freelancer hired successfully',
       bid: updatedBid,
       gigTitle: gig.title,
-      freelancerId: bid.freelancer._id,
+      freelancerId: updatedBid.freelancer._id,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error during hiring process' });
+    // Rollback transaction on any error
+    await session.abortTransaction();
+    console.error('Hiring transaction error:', error);
+    res.status(500).json({ message: 'Server error during hiring process. Transaction rolled back.' });
+  } finally {
+    // End session
+    session.endSession();
   }
 };

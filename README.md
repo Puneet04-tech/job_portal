@@ -14,6 +14,7 @@ GigFlow is a full-stack mini-freelance marketplace where clients can post jobs (
 
 ### Bonus Features Implemented
 1. **Transactional Integrity**: MongoDB transactions ensure race condition safety during the hiring process
+   - See [BONUS_FEATURES_EXPLANATION.md](BONUS_FEATURES_EXPLANATION.md) for detailed technical documentation
 2. **Real-time Notifications**: Socket.io integration for instant notifications when freelancers get hired
 
 ## 🛠️ Tech Stack
